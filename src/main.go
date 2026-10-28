@@ -21,6 +21,7 @@ import (
 	"path/filepath"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 )
 
@@ -110,7 +111,10 @@ type Server struct {
 	models []Model
 	catAt  time.Time
 
-	sem chan struct{}
+	slots  int
+	inflMu sync.Mutex
+	infl   []*inflight
+	inflSeq int64
 
 	statMu    sync.Mutex
 	okCount   int
@@ -120,6 +124,44 @@ type Server struct {
 
 	evMu sync.Mutex
 	evs  []Event
+}
+
+// inflight 是一个正在执行的对话任务，可被更新的请求抢占。
+type inflight struct {
+	id      int64
+	started time.Time
+	ctx     context.Context
+	cancel  context.CancelFunc
+}
+
+// errPreempted 表示该请求因并发槽被占而被更新的请求顶掉。
+var errPreempted = errors.New("该请求已被更新的请求抢占")
+
+// acquire 申请一个并发槽：槽满时抢占最旧的任务（取消它），再放入新任务。
+func (s *Server) acquire() (job *inflight, evicted *inflight) {
+	s.inflMu.Lock()
+	defer s.inflMu.Unlock()
+	if s.slots > 0 && len(s.infl) >= s.slots {
+		evicted = s.infl[0]
+		s.infl = s.infl[1:]
+		evicted.cancel()
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	job = &inflight{id: atomic.AddInt64(&s.inflSeq, 1), started: time.Now(), ctx: ctx, cancel: cancel}
+	s.infl = append(s.infl, job)
+	return job, evicted
+}
+
+func (s *Server) release(job *inflight) {
+	job.cancel()
+	s.inflMu.Lock()
+	defer s.inflMu.Unlock()
+	for i, f := range s.infl {
+		if f == job {
+			s.infl = append(s.infl[:i], s.infl[i+1:]...)
+			return
+		}
+	}
 }
 
 func main() {
@@ -148,7 +190,7 @@ func main() {
 				MaxIdleConns:    16,
 			},
 		},
-		sem: make(chan struct{}, 4),
+		slots: 4,
 	}
 	if cfg.AdminKey == "" {
 		cfg.AdminKey = randHex(16)
@@ -626,16 +668,20 @@ func (s *Server) handleChat(w http.ResponseWriter, r *http.Request) {
 		model = s.snapshot().DefaultModel
 	}
 
-	select {
-	case s.sem <- struct{}{}:
-		defer func() { <-s.sem }()
-	default:
-		writeErr(w, http.StatusTooManyRequests, "too many concurrent requests")
-		return
+	job, evicted := s.acquire()
+	defer s.release(job)
+	if evicted != nil {
+		s.event("warn", fmt.Sprintf("并发槽已满，抢占最旧请求 #%d（已等待 %s）", evicted.id,
+			time.Since(evicted.started).Round(time.Second)))
 	}
 
-	text, modelID, err := s.complete(model, msgs)
+	text, modelID, err := s.completeCtx(job.ctx, model, msgs)
 	if err != nil {
+		if errors.Is(err, errPreempted) {
+			s.event("warn", fmt.Sprintf("请求 #%d 被新请求抢占，已中止", job.id))
+			writeErr(w, http.StatusServiceUnavailable, errPreempted.Error())
+			return
+		}
 		s.recordResult(false, err.Error())
 		s.event("error", "对话失败: "+err.Error())
 		writeErr(w, http.StatusBadGateway, err.Error())
@@ -675,11 +721,19 @@ func (s *Server) handleChat(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) complete(model string, msgs []chatMessage) (string, string, error) {
-	text, modelID, _, err := s.completeTimed(model, msgs)
+	return s.completeCtx(context.Background(), model, msgs)
+}
+
+func (s *Server) completeCtx(ctx context.Context, model string, msgs []chatMessage) (string, string, error) {
+	text, modelID, _, err := s.completeTimedCtx(ctx, model, msgs)
 	return text, modelID, err
 }
 
 func (s *Server) completeTimed(model string, msgs []chatMessage) (string, string, Timing, error) {
+	return s.completeTimedCtx(context.Background(), model, msgs)
+}
+
+func (s *Server) completeTimedCtx(ctx context.Context, model string, msgs []chatMessage) (string, string, Timing, error) {
 	cfg := s.snapshot()
 	modelID, modelConfigID, err := s.resolveModel(model)
 	if err != nil {
@@ -688,12 +742,12 @@ func (s *Server) completeTimed(model string, msgs []chatMessage) (string, string
 	pid := cfg.Upstream.ProjectID
 	sid := newSessionID()
 
-	if _, err := s.call("POST", "/sessions", map[string]any{
+	if _, err := s.callCtx(ctx, "POST", "/sessions", map[string]any{
 		"projectId": pid, "session_id": sid, "model": modelID,
 	}); err != nil {
 		return "", "", Timing{}, fmt.Errorf("创建会话失败: %w", err)
 	}
-	if _, err := s.call("POST", "/sessions/prompt", map[string]any{
+	if _, err := s.callCtx(ctx, "POST", "/sessions/prompt", map[string]any{
 		"message":       buildPrompt(msgs),
 		"modelConfigId": modelConfigID,
 		"projectId":     pid,
@@ -709,9 +763,16 @@ func (s *Server) completeTimed(model string, msgs []chatMessage) (string, string
 	}
 	var lastErr string
 	for deadline.IsZero() || time.Now().Before(deadline) {
-		time.Sleep(900 * time.Millisecond)
-		body, err := s.call("GET", "/sessions/messages?projectId="+pid+"&session_id="+sid, nil)
+		select {
+		case <-ctx.Done():
+			return "", "", Timing{}, errPreempted
+		case <-time.After(900 * time.Millisecond):
+		}
+		body, err := s.callCtx(ctx, "GET", "/sessions/messages?projectId="+pid+"&session_id="+sid, nil)
 		if err != nil {
+			if ctx.Err() != nil {
+				return "", "", Timing{}, errPreempted
+			}
 			if err.Error() != lastErr {
 				log.Printf("轮询失败(%s): %v", sid, err)
 				lastErr = err.Error()
@@ -805,6 +866,14 @@ func (s *Server) call(method, path string, payload any) ([]byte, error) {
 }
 
 func (s *Server) callWith(method, path string, payload any, cookie string) ([]byte, error) {
+	return s.callWithCtx(context.Background(), method, path, payload, cookie)
+}
+
+func (s *Server) callCtx(ctx context.Context, method, path string, payload any) ([]byte, error) {
+	return s.callWithCtx(ctx, method, path, payload, s.snapshot().Upstream.Cookie)
+}
+
+func (s *Server) callWithCtx(ctx context.Context, method, path string, payload any, cookie string) ([]byte, error) {
 	var body io.Reader
 	if payload != nil {
 		b, err := json.Marshal(payload)
@@ -814,7 +883,7 @@ func (s *Server) callWith(method, path string, payload any, cookie string) ([]by
 		body = bytes.NewReader(b)
 	}
 	cfg := s.snapshot()
-	req, err := http.NewRequest(method, cfg.Upstream.Base+path, body)
+	req, err := http.NewRequestWithContext(ctx, method, cfg.Upstream.Base+path, body)
 	if err != nil {
 		return nil, err
 	}
