@@ -202,7 +202,7 @@ func main() {
 
 func applyDefaults(c *Config) {
 	if c.TimeoutSecond <= 0 {
-		c.TimeoutSecond = 300
+		c.TimeoutSecond = 900
 	}
 	if c.Upstream.Base == "" {
 		c.Upstream.Base = "https://aistudio.ai4s.com.cn/partner/pi-agent/api"

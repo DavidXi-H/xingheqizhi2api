@@ -3,7 +3,7 @@
   "api_key": "改成你自己的随机字符串",
   "admin_key": "",
   "default_model": "auto",
-  "timeout_seconds": 300,
+  "timeout_seconds": 900,
   "auto_capture": true,
   "cookie_sources": [
     "/Users/你的用户名/Library/Application Support/Trae CN/Partitions/trae-webview/Cookies",
