@@ -89,7 +89,7 @@ curl -s $OPENAI_BASE_URL/chat/completions \
 | `api_key` | 调用 `/v1/*` 时校验的密钥（`Authorization: Bearer` 或 `X-Api-Key`） |
 | `admin_key` | 管理面板密钥；留空则首次启动自动生成并写回 `config.json` |
 | `default_model` | 默认模型；`auto` 表示取上游模型列表的第一个 |
-| `timeout_seconds` | 单次对话最长等待秒数，默认 900（长文/长上下文较慢，勿随意调小） |
+| `timeout_seconds` | 单次对话最长等待秒数，默认 900；设为 `0` 表示**无限等待**（不推荐在日常使用，上游无响应会一直占住并发槽） |
 | `auto_capture` | 是否启动时自动抓取登录凭证，并每 10 分钟同步一次 |
 | `cookie_sources` | 浏览器 Cookie 库路径列表（按顺序尝试，见下节） |
 | `upstream.base` | `pi-agent` 接口根地址，一般不用改 |

@@ -110,9 +110,40 @@ token 数为估算（中日韩字符 ×0.7/字，其余 4 字符 ≈ 1 token）�
 | --- | --- |
 | ![deepseek-v4.1-flash](images/pelican-deepseek-v4.1-flash.png) | ![deepseek-v4-pro-0813](images/pelican-deepseek-v4-pro-0813.png) |
 
+## 6. 动态鹈鹕骑车（SVG 动画）
+
+题面在静态版基础上加动画约束：必须**自包含**（不许 JS、不许外链），用 SMIL `<animateTransform>`
+或 CSS `@keyframes` 实现「车轮转、曲柄/踏板转、身体轻微起伏」，且无限循环。
+
+| 模型 | 耗时 | SVG | 动画元素 | 结果 |
+| --- | --- | --- | --- | --- |
+| `qwen3.8-max` | 254.7 s | 8 KB | 9 个 `animateTransform` | 成功，最完整 |
+| `glm-5.2` | 197.3 s | 7 KB | 4 个 `animateTransform` | 成功，卡通风格 |
+| `deepseek-v4.1-flash` | 312.7 s / 259.2 s（两次） | — | — | 失败：上游始终没有助手回复 |
+| `deepseek-v4-pro-0813` | 425.0 s | — | — | 失败：同上 |
+
+- `qwen3.8-max`：红车架、链条、脚踏齐全，鹈鹕白身橙腿大喙坐在车座、车轮触地；
+  9 个动画覆盖两轮旋转、曲柄转动、整车位移、鹈鹕起伏。
+- `glm-5.2`：蓝天太阳构图，车 0.6 s 一圈、曲柄 0.8 s、身体起伏；鹈鹕比例略大、腿偏细。
+
+验证方式：在真实浏览器里对页面间隔 1.5 s 截两帧，比对辐条角度/曲柄位置/车身位移，
+并检查 DOM 中 SMIL 是否处于激活状态。
+
+| qwen3.8-max（首帧） | glm-5.2（首帧） |
+| --- | --- |
+| ![anim-qwen](images/pelican-anim-qwen3.8-max.svg) | ![anim-glm](images/pelican-anim-glm-5.2.svg) |
+
+两点经验：
+
+1. **动画题比静态题重**：静态 45–220 s 出图，动画 197–255 s，且只有一半模型能完成。
+2. **失败表现为"没有助手回复"**：抓到的 395 字节其实是 prompt 回显（最后一条是 `user` 消息），
+   说明上游根本没开始回答，不是被截断。这类请求经反代容易撞到超时上限（设 `timeout_seconds: 0`
+   可无限等待，但会一直占住并发槽）。
+
 ## 复现提示
 
 - 速率/上下文/输出三类测试都是普通 OpenAI 格式请求，直接打 `/v1/chat/completions` 即可；
   needle 测试把填充文本压到一条 `user` 消息里。
 - 思考强度需要直连上游 `/sessions/messages` 才能看到 `thinking` 块，反代输出里没有。
-- SVG 渲染在本机用 macOS 自带的 `qlmanage -t -s 900 -o <dir> <file>.svg`，无需额外依赖。
+- SVG 渲染在本机用 macOS 自带的 `qlmanage -t -s 900 -o <dir> <file>.svg`，无需额外依赖；
+  动画需在浏览器里看，静态渲染只能看到首帧。

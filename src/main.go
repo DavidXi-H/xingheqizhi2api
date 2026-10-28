@@ -201,7 +201,7 @@ func main() {
 }
 
 func applyDefaults(c *Config) {
-	if c.TimeoutSecond <= 0 {
+	if c.TimeoutSecond < 0 {
 		c.TimeoutSecond = 900
 	}
 	if c.Upstream.Base == "" {
@@ -703,9 +703,12 @@ func (s *Server) completeTimed(model string, msgs []chatMessage) (string, string
 	}
 	promptAt := time.Now()
 
-	deadline := promptAt.Add(time.Duration(cfg.TimeoutSecond) * time.Second)
+	deadline := time.Time{}
+	if cfg.TimeoutSecond > 0 {
+		deadline = promptAt.Add(time.Duration(cfg.TimeoutSecond) * time.Second)
+	}
 	var lastErr string
-	for time.Now().Before(deadline) {
+	for deadline.IsZero() || time.Now().Before(deadline) {
 		time.Sleep(900 * time.Millisecond)
 		body, err := s.call("GET", "/sessions/messages?projectId="+pid+"&session_id="+sid, nil)
 		if err != nil {
