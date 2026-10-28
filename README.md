@@ -1,4 +1,7 @@
-# sais2api — 星河启智 OpenAI 兼容反代
+# 星河启智 反代（xingheqizhi2api / sais2api）— OpenAI 兼容 API
+
+**星河启智 反代** · 星河启智 API · 大圣科学智能 Agent 逆向 · ai4s 反代 ·
+`aistudio.ai4s.com.cn` OpenAI 兼容 · 上海科学智能研究院（SAIS）对话接口 · `pi-agent` 协议
 
 把「星河启智」（`aistudio.ai4s.com.cn`，大圣科学智能 Agent）网页对话背后的 `pi-agent` 接口，
 逆向成本地一个 **OpenAI 兼容** HTTP 反代：任意 OpenAI SDK / `curl` 指向本服务即可反向调用
@@ -9,6 +12,11 @@
   请遵守上游服务条款，不要用于商业用途、批量注册、转售或任何滥用行为；由此产生的一切后果由使用者自负。
 
 > 本仓库只包含反代程序与部署文件，**不包含**任何账号、Cookie、token 或密钥。
+
+`xingheqizhi2api` (sais2api) is an OpenAI-compatible reverse proxy for the
+AI-for-Science chat agent at `aistudio.ai4s.com.cn`, with a built-in web admin panel
+and automatic cookie-based credential capture.
+
 
 ---
 
