@@ -1,0 +1,15 @@
+# 实际配置（含 api_key、admin_key、登录凭证）——只提交 config.example.json
+config.json
+
+# 运行时产物
+logs/
+data/
+src/sais2api
+src/sais2api-*
+bin/
+*.log
+*.bak
+*.tmp
+
+# 系统杂项
+.DS_Store

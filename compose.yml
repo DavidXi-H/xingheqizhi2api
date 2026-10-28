@@ -1,0 +1,21 @@
+# sais2api 部署编排
+#
+# 为什么端口用 3067：与同机运行的 xiaohuanxiong2api（3066）区分，避免端口冲突。
+# 注意：Cookie 库自动抓取依赖宿主 macOS 的浏览器数据库，容器内无法使用，
+#       容器部署请改为在 config.json 里手工填 upstream.cookie（见 README）。
+services:
+  sais2api:
+    build:
+      context: ./src
+      args:
+        VERSION: "0.1.0"
+    image: sais2api:local
+    container_name: sais2api
+    restart: unless-stopped
+    environment:
+      TZ: Asia/Shanghai
+    ports:
+      - "3067:3067"
+    volumes:
+      - ./config.json:/app/config.json:ro
+      - /usr/share/zoneinfo:/usr/share/zoneinfo:ro

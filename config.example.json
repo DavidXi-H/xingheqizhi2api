@@ -1,0 +1,21 @@
+{
+  "listen": "127.0.0.1:3067",
+  "api_key": "改成你自己的随机字符串",
+  "admin_key": "",
+  "default_model": "auto",
+  "timeout_seconds": 300,
+  "auto_capture": true,
+  "cookie_sources": [
+    "/Users/你的用户名/Library/Application Support/Trae CN/Partitions/trae-webview/Cookies",
+    "/Users/你的用户名/Library/Application Support/Trae CN/Cookies"
+  ],
+  "upstream": {
+    "base": "https://aistudio.ai4s.com.cn/partner/pi-agent/api",
+    "cookie": "",
+    "user_id": "",
+    "user_name": "",
+    "project_id": "",
+    "user_agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36",
+    "source": ""
+  }
+}
