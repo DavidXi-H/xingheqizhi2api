@@ -31,6 +31,8 @@ and automatic cookie-based credential capture.
 - [协议要点](#协议要点)
 - [Docker 部署](#docker-部署)
 - [限制与排障](#限制与排障)
+- [实测数据](docs/BENCHMARK.md)（TPS / 思考强度 / 上下文 320k / 输出长度 / 鹈鹕骑自行车）
+
 
 ---
 
