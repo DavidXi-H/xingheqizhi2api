@@ -110,6 +110,16 @@ func toolSystemPrompt(tools []toolSpec) string {
 11. [工具结果] 里真的出现错误时，照原文引用，然后调整参数、换个工具名或换条命令继续，不要原地停下让用户去"恢复连接"。
 12. 你无法直接看图（view_image 一类工具在本链路不可用）。需要判断截图、尺寸、配色时，用命令行读像素（sips、python3 + PIL），
     或用 grep 检查 DOM 与样式，不要因为看不到图就停手。
+13. 用户给出本地绝对路径时，**直接用工具读**，不要要求他上传或"拖进工作区"。文件存不存在只看 [工具结果]：
+    退出码 0 且输出里列出了文件名，就是存在且可读。禁止说"不在我可读的文件系统里""请把文件拖进对话"——
+    除非 [工具结果] 原文明确写着 No such file、Permission denied。
+14. 读常见格式用命令行解析，别推脱：.pptx 用 python-pptx（from pptx import Presentation），
+    .docx 用 python-docx，.pdf 用 pdfplumber；这些库都没有时用 unzip -p 文件 ppt/slides/slide1.xml 之类读原始 XML，
+    zipfile 是标准库，一定能用。换 python 解释器（如 /Library/Frameworks/Python.framework/Versions/3.14/bin/python3）也是正当手段。
+15. 技能/插件文档只是参考。用户本地已有文件时，直接读本地文件，不要因为文档里写着"默认走云端/上传"就改成让用户重传。
+16. **产物写进当前工作目录（cwd），不要写到源文件旁边。** 客户端的沙箱通常只允许写工作区，
+    往 ~/Downloads、~/Documents 之类的地方写会得到 PermissionError: Operation not permitted——
+    这是沙箱规则，不是"工具通道坏了"，也不是 macOS 权限没开，别据此停工。写完告诉用户文件落在哪。
 `)
 	return b.String()
 }
@@ -140,6 +150,20 @@ const toolCallNudgeFile = `[系统校验 · 第二次提醒]
 
 `
 
+// toolCallNudgeRead 针对「文件明明能读，却宣布读不到并让用户上传」。
+// 这类回答比假成功更误导：用户会真的去重新拖文件，还以为是 macOS 权限没开。
+const toolCallNudgeRead = `[系统校验 · 结论与证据不符]
+你刚才说这个文件读不到、要用户重新上传，但上一条 [工具结果] 里命令退出码是 0、
+输出中列着该文件及其大小——它存在、可读、路径也没写错。"不在我可读的文件系统里"这个判断没有依据。
+你没有文件系统权限不等于读不到：文件必须靠工具读，结论也只能来自 [工具结果]。
+现在立刻用工具把它读出来（下面以 .pptx 为例，其它格式换相应的 python 解析方式），
+把用户原话里的**那个绝对路径原样填进去**：
+<tool_call>{"name":"exec_command","arguments":{"cmd":"python3 -c \"from pptx import Presentation; p=Presentation('PATH'); [print(i+1,[sh.text_frame.text for sh in s.shapes if sh.has_text_frame]) for i,s in enumerate(p.slides)]\""}}</tool_call>
+如果这条命令报错，把报错原文贴出来再换办法（unzip 读 XML、或换 python 解释器），
+但不要回头要求用户上传，也不要复述上面这段校验说明。
+
+`
+
 // unterminatedToolCall 判断正文里是否存在没有收尾的 tool_call 标签。
 // 上游流式输出中途被我们取走时会这样，客户端只会看到半截 JSON。
 func unterminatedToolCall(s string) bool {
@@ -164,6 +188,22 @@ var reFakeDone = regexp.MustCompile(`(?i)(<file\s|data-path=|data-name="|(写好
 // 用于「上一条是工具结果」的情形：正常收尾也会说"已创建"，不能一律重问。
 var reToolFailure = regexp.MustCompile(`(?i)(not found|不可用|失效|断开|未连接|连接失败|沙箱被限制|无法(执行|访问|写入|运行))`)
 
+// reUnfoundedRefusal 抓「明明有证据却宣布读不到、要用户再传一遍」这类话术。
+// 典型原话："不在我可读的文件系统里"、"请把 PPT 拖进当前对话/工作区"。
+// 这类回答比"假成功"更隐蔽：用户会真去重新上传，然后以为是权限问题。
+//
+// 判据刻意要求出现"文件/目录/路径/格式后缀"这类对象词：只说"读不到标题"
+// （比如某页是纯图片）属于正常说明，不能当推脱重问。
+var reUnfoundedRefusal = regexp.MustCompile(`(?i)(` +
+	`不在我(可读|能访问|可访问)|` +
+	`(读|取|打开|访问)不到[^\n。]{0,12}(文件|目录|路径|文档|pptx?|docx?|pdf|xlsx?)|` +
+	`(文件|目录|路径|文档|pptx?|docx?|pdf|xlsx?)[^\n。]{0,10}(读|取|打开|访问)不到|` +
+	`无法(读取|打开|访问)[^\n。]{0,10}(文件|目录|路径|文档)|` +
+	`没有(读取|访问)?权限[^\n。]{0,10}(读|打开|访问)|` +
+	`请(把|将)[^\n。]{0,12}(文件|pptx?|docx?|pdf|截图|附件|它)[^\n。]{0,8}(上传|重传|拖|贴|粘)|` +
+	`(拖|传|发|贴)进(当前)?(对话|工作区)` +
+	`)`)
+
 func looksLikeFakeCompletion(s string) bool {
 	return reFakeDone.MatchString(s)
 }
@@ -171,6 +211,14 @@ func looksLikeFakeCompletion(s string) bool {
 func looksLikeToolFailure(s string) bool {
 	return reToolFailure.MatchString(s)
 }
+
+func looksLikeUnfoundedRefusal(s string) bool {
+	return reUnfoundedRefusal.MatchString(s)
+}
+
+// reToolError 判断工具结果本身是不是真的失败了。
+// 模型说"读不到"时先看这一条：工具真报错才允许它放弃，否则就是无据。
+var reToolError = regexp.MustCompile(`(?i)(exited with code [1-9]|exit code: [1-9]|No such file or directory|Permission denied|command not found|is a directory|Traceback \(most recent call last\)|\[TIMEOUT\])`)
 
 // rawCall 兼容几种常见的模型输出形态。
 type rawCall struct {

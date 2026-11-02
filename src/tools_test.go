@@ -140,3 +140,51 @@ func TestBuildPromptWithoutTools(t *testing.T) {
 		t.Errorf("prompt 丢了正文")
 	}
 }
+
+func TestLooksLikeUnfoundedRefusal(t *testing.T) {
+	yes := []string{
+		"这份 PPT 我还没有读到，而 /Users/x/1102-大模型越狱.pptx 不在我可读的文件系统里。",
+		"请把 PPT 拖进当前对话/工作区，或把作业要求截图发来。",
+		"我无法读取该文件，可能是权限问题。",
+		"没有权限读取这个目录。",
+		"实在访问不到这个路径，麻烦你重新上传。",
+	}
+	for _, s := range yes {
+		if !looksLikeUnfoundedRefusal(s) {
+			t.Errorf("应判为无据放弃: %q", s)
+		}
+	}
+	no := []string{
+		"已经修好 price.py，3 个测试全部通过。",
+		"当前目录下有 3 个 .txt 文件，已写入 report.md。",
+		"这个项目没有 config.yaml，我创建了 no-config.txt 说明情况。",
+		"结论：越狱攻击的常见手段有三类。",
+		"第 3 页和第 6 页是纯图片，读不到文字标题，我按图表页标注了。",
+		"第 20 页原文已整理完，notes.md 写在当前目录。",
+	}
+	for _, s := range no {
+		if looksLikeUnfoundedRefusal(s) {
+			t.Errorf("不该判为无据放弃: %q", s)
+		}
+	}
+}
+
+func TestLastToolLooksFailed(t *testing.T) {
+	ok := []chatMessage{
+		{Role: "user", Content: "读一下 pptx"},
+		{Role: "tool", Content: "Process exited with code 0\nOutput:\n-rw-r--r--@ 1 u staff 5050109 1102-大模型越狱.pptx"},
+	}
+	if lastToolLooksFailed(ok) {
+		t.Error("退出码 0 不该判为失败")
+	}
+	bad := []chatMessage{
+		{Role: "tool", Content: "Process exited with code 1\nOutput:\nNo such file or directory"},
+	}
+	if !lastToolLooksFailed(bad) {
+		t.Error("No such file 应判为失败")
+	}
+	none := []chatMessage{{Role: "user", Content: "hi"}}
+	if lastToolLooksFailed(none) {
+		t.Error("没有工具结果时不该判为失败")
+	}
+}

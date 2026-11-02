@@ -753,9 +753,15 @@ func (s *Server) handleChat(w http.ResponseWriter, r *http.Request) {
 			lastRole = msgs[len(msgs)-1].Role
 		}
 		why := ""
+		readRefusal := false
 		switch {
 		case unterminatedToolCall(text):
 			why = "tool_call 被截断"
+		case lastRole == "tool" && !lastToolLooksFailed(msgs) && looksLikeUnfoundedRefusal(content):
+			// 工具结果明明是成功的，模型却说读不到、要用户重新上传。这条比"假成功"
+			// 更会骗人：用户会真的去重传文件，还以为是系统权限没开。
+			why = "无据宣称读不到文件"
+			readRefusal = true
 		case lastRole == "tool":
 			// 刚拿到工具结果就说"做完了"是正常的收尾，只有它同时宣称工具坏了才重问。
 			if looksLikeToolFailure(content) {
@@ -766,11 +772,17 @@ func (s *Server) handleChat(w http.ResponseWriter, r *http.Request) {
 		}
 		if why != "" {
 			s.event("warn", why+"，重问一次")
-			nudges := []string{toolCallNudge, toolCallNudgeFile}
-			if first.WallMS > 150000 {
-				// 第一轮就很慢（大段 SVG / 长文），再补两轮会把一次请求拖到十几分钟，
-				// 客户端多半先超时。慢任务只给一次纠正机会。
-				nudges = nudges[:1]
+			var nudges []string
+			if readRefusal {
+				// 读取类只需要一句话：别放弃，直接读。给写入模板会把它带偏。
+				nudges = []string{toolCallNudgeRead}
+			} else {
+				nudges = []string{toolCallNudge, toolCallNudgeFile}
+				if first.WallMS > 150000 {
+					// 第一轮就很慢（大段 SVG / 长文），再补两轮会把一次请求拖到十几分钟，
+					// 客户端多半先超时。慢任务只给一次纠正机会。
+					nudges = nudges[:1]
+				}
 			}
 			// 把上一轮的（假）答复也带进上下文：纠正话术说"你刚才……"，
 			// 模型得先看见自己刚说过什么才认账；不带的话它只会当成无端指责。
@@ -1313,6 +1325,19 @@ func extractText(m upstreamMessage) string {
 		}
 	}
 	return strings.TrimSpace(b.String())
+}
+
+// lastToolLooksFailed 看最近一条工具结果本身是否报错。
+// 模型说"读不到"时先问一句：是不是工具真失败了？真失败就让它如实汇报，
+// 工具明明成功还这么说，就是无据放弃，得重问。
+func lastToolLooksFailed(msgs []chatMessage) bool {
+	for i := len(msgs) - 1; i >= 0; i-- {
+		if msgs[i].Role != "tool" {
+			continue
+		}
+		return reToolError.MatchString(msgs[i].Content)
+	}
+	return false
 }
 
 func lastEnded(m upstreamMessage) bool {
