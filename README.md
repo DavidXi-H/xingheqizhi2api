@@ -163,8 +163,59 @@ JWT 自带 `exp`，面板会显示到期时间；过期后在浏览器重新登�
 | POST | `/admin/api/test` | `X-Admin-Key` | 发一条测试对话 |
 | POST | `/admin/api/speed` | `X-Admin-Key` | 速率测试，body `{"model":"…"}` |
 
-`/v1/chat/completions` 只转发文本：多轮 `messages` 会被压平成一条 prompt 发给上游
-（system 在前，历史段落标注 `[对话历史]` / `[当前问题]`），因此 `usage` 字段为空。
+`/v1/chat/completions` 支持 OpenAI 的 `tools` / `tool_calls`（实现方式是提示词模拟，
+见下一节「工具调用」）。多轮 `messages` 会被压平成一条 prompt 发给上游
+（system 在前，历史段落标注 `[对话历史]` / `[当前问题]`，工具结果标注 `[工具结果]`），
+因此 `usage` 字段为空。
+
+---
+
+## 工具调用（提示词模拟）
+
+上游「大圣」是个自带工具的 Agent，接口里没有 `tools` 参数，也不返回 `tool_calls`。
+本项目在中间做了一层协议模拟，让标准 OpenAI 客户端（Codex、Cherry Studio、LobeChat…）
+可以直接用函数调用。
+
+链路：
+
+```
+客户端 ──tools──> sais2api ──(工具清单 + 调用格式写进 prompt)──> 上游
+                       <──(模型输出 <tool_call>{...}</tool_call>)──
+客户端 <──tool_calls──
+客户端 ──role:"tool" 的结果──> sais2api ──[工具结果] 段落──> 上游
+```
+
+三个关键点：
+
+1. **提示词里必须明确「你的沙箱不是用户的机器」。** 上游 Agent 自带的 shell / 文件工具
+   会抢活：你让它列目录，它直接在自己沙箱 `/pi-agent/...` 里跑一遍，返回一堆假结果。
+   所以协议开头有 `【运行模式覆盖 · 优先级最高】` 一段，把它的默认环境判定为无效。
+   这一段是整套方案能否工作的分水岭，不要删。
+2. **输出解析要宽容。** 模型偶尔会漏标签、套代码块、只吐裸 JSON，`parseToolCalls`
+   依次兜底：成对标签 → 未闭合标签 → ```tool_call 代码块 → 整段裸 JSON。
+   `arguments` 无论是对象还是字符串，最终都会规范化成合法 JSON 字符串。
+3. **工具名要纠正。** 客户端下发的名字不固定（Codex 有时是 `exec_command`，有时是 `shell`），
+   模型容易按记忆写错。`matchToolName` 会做精确 → 忽略大小写 → 去命名空间前缀 →
+   语义别名（exec/shell/bash/run 互认）→ 唯一工具兜底的逐级匹配。
+
+支持的形态：
+
+| 能力 | 状态 |
+| --- | --- |
+| 单个 / 并行多个工具调用 | ✅ |
+| 多轮（工具结果回填后继续） | ✅ |
+| 流式返回 `tool_calls` | ✅ 先发 id/name，再发 arguments |
+| `tool_choice: "none"` | ✅ 忽略 tools |
+| `type: custom` / `namespace` 类工具 | ⚠️ 丢弃（chat 协议表达不了） |
+
+代价与风险，使用前要清楚：
+
+- 每次调用都会把完整工具清单塞进 prompt，工具多、schema 大时 prompt 会很长，
+  首 token 延迟和额度消耗都会上去；
+- 模型对格式的遵守不是 100%，实测 `deepseek-v4.1-flash` 在明确指令下很稳，
+  但换模型要重新验证；
+- 只支持 `function` 类型；`apply_patch` 这类自定义工具不转发，
+  客户端会退回用 shell 改文件。
 
 ---
 
@@ -250,12 +301,14 @@ docker compose up -d --build
 | `/v1/models` 返回 502 | 凭证失效；面板看「最近事件」，重新登录后抓取 |
 | 面板提示「缺少管理密钥」 | 访问 `/admin` 时带 `?key=<admin_key>` |
 | 抓取报「没有找到可用的浏览器 Cookie 库」 | `cookie_sources` 路径不对，或服务进程没有磁盘访问权限 |
+| 模型说"工具不存在 / 文件没动" | 它可能在自己的沙箱里执行了。检查 prompt 里 `【运行模式覆盖】` 段是否还在，或换更听话的模型 |
+| 只回文字、不调工具 | 该模型的指令遵循偏弱；换 `deepseek-v4.1-flash` 或提高工具描述的具体度 |
 
 其他：
 
 - 并发上限 4；槽满时**新请求抢占最旧的在途请求**——旧请求立刻收到
   `503 {"error":{"message":"该请求已被更新的请求抢占"}}`，新请求正常排队执行；
-- 只转发文本，不转发图片 / 工具调用；
+- 只转发文本与函数工具调用；图片不转发；`type: custom` / `namespace` 工具不转发；
 - 上游是「对话式」接口，每次请求都会新建一个会话，历史靠 prompt 拼接。
 
 ---

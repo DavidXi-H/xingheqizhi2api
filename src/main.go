@@ -80,18 +80,34 @@ type messagesResp struct {
 	} `json:"data"`
 }
 
+type inMessage struct {
+	Role       string          `json:"role"`
+	Content    json.RawMessage `json:"content"`
+	ToolCalls  []toolCall      `json:"tool_calls"`
+	ToolCallID string          `json:"tool_call_id"`
+	Name       string          `json:"name"`
+}
+
 type chatRequest struct {
-	Model    string `json:"model"`
-	Messages []struct {
-		Role    string          `json:"role"`
-		Content json.RawMessage `json:"content"`
-	} `json:"messages"`
-	Stream bool `json:"stream"`
+	Model      string          `json:"model"`
+	Messages   []inMessage     `json:"messages"`
+	Stream     bool            `json:"stream"`
+	Tools      []toolSpec      `json:"tools"`
+	ToolChoice json.RawMessage `json:"tool_choice"`
 }
 
 type chatMessage struct {
-	Role    string `json:"role"`
-	Content string `json:"content"`
+	Role       string     `json:"role"`
+	Content    string     `json:"content"`
+	ToolCalls  []toolCall `json:"tool_calls,omitempty"`
+	ToolCallID string     `json:"tool_call_id,omitempty"`
+	Name       string     `json:"name,omitempty"`
+}
+
+// toolChoiceNone 判断客户端是否显式关闭了工具调用。
+func toolChoiceNone(raw json.RawMessage) bool {
+	s := strings.TrimSpace(string(raw))
+	return s == `"none"`
 }
 
 type Event struct {
@@ -655,12 +671,37 @@ func (s *Server) handleChat(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	msgs := make([]chatMessage, 0, len(req.Messages))
+	// tool_call_id → 工具名，方便把工具结果标注清楚。
+	callName := map[string]string{}
 	for _, m := range req.Messages {
-		msgs = append(msgs, chatMessage{Role: m.Role, Content: contentText(m.Content)})
+		for _, c := range m.ToolCalls {
+			if c.ID != "" {
+				callName[c.ID] = c.Function.Name
+			}
+		}
+	}
+	for _, m := range req.Messages {
+		name := m.Name
+		if name == "" && m.ToolCallID != "" {
+			name = callName[m.ToolCallID]
+		}
+		msgs = append(msgs, chatMessage{
+			Role:       m.Role,
+			Content:    contentText(m.Content),
+			ToolCalls:  m.ToolCalls,
+			ToolCallID: m.ToolCallID,
+			Name:       name,
+		})
 	}
 	if len(msgs) == 0 {
 		writeErr(w, http.StatusBadRequest, "messages is empty")
 		return
+	}
+
+	// 工具：上游没有原生 function calling，这里走提示词模拟。
+	tools := usableTools(req.Tools)
+	if toolChoiceNone(req.ToolChoice) {
+		tools = nil
 	}
 
 	model := strings.TrimSpace(req.Model)
@@ -675,7 +716,7 @@ func (s *Server) handleChat(w http.ResponseWriter, r *http.Request) {
 			time.Since(evicted.started).Round(time.Second)))
 	}
 
-	text, modelID, err := s.completeCtx(job.ctx, model, msgs)
+	text, modelID, err := s.completeCtx(job.ctx, model, msgs, tools)
 	if err != nil {
 		if errors.Is(err, errPreempted) {
 			s.event("warn", fmt.Sprintf("请求 #%d 被新请求抢占，已中止", job.id))
@@ -689,8 +730,21 @@ func (s *Server) handleChat(w http.ResponseWriter, r *http.Request) {
 	}
 	s.recordResult(true, "")
 
+	// 把模型回复里的 <tool_call> 剥出来，翻成 OpenAI 的 tool_calls。
+	content, calls := parseToolCalls(text)
+	calls = repairCalls(calls, tools)
+	if strings.TrimSpace(content) == "" && len(calls) == 0 {
+		// 空回复对客户端来说最难受：既没内容也没有调用，只会让人以为任务已完成。
+		s.recordResult(false, "模型返回空内容")
+		writeErr(w, http.StatusBadGateway, "模型返回空内容，请重试")
+		return
+	}
+	if len(calls) > 0 {
+		s.event("info", fmt.Sprintf("工具调用 %d 个: %s", len(calls), callNames(calls)))
+	}
+
 	if req.Stream {
-		streamResult(w, modelID, text)
+		streamResult(w, modelID, content, calls)
 		return
 	}
 
@@ -715,25 +769,39 @@ func (s *Server) handleChat(w http.ResponseWriter, r *http.Request) {
 	resp.Object = "chat.completion"
 	resp.Created = time.Now().Unix()
 	resp.Model = modelID
-	resp.Choices = []choice{{Index: 0, Message: chatMessage{Role: "assistant", Content: text}, FinishReason: "stop"}}
+	finish := "stop"
+	msg := chatMessage{Role: "assistant", Content: content}
+	if len(calls) > 0 {
+		finish = "tool_calls"
+		msg.ToolCalls = calls
+	}
+	resp.Choices = []choice{{Index: 0, Message: msg, FinishReason: finish}}
 	w.Header().Set("Content-Type", "application/json")
 	json.NewEncoder(w).Encode(resp)
 }
 
-func (s *Server) complete(model string, msgs []chatMessage) (string, string, error) {
-	return s.completeCtx(context.Background(), model, msgs)
+func callNames(calls []toolCall) string {
+	names := make([]string, 0, len(calls))
+	for _, c := range calls {
+		names = append(names, c.Function.Name)
+	}
+	return strings.Join(names, ", ")
 }
 
-func (s *Server) completeCtx(ctx context.Context, model string, msgs []chatMessage) (string, string, error) {
-	text, modelID, _, err := s.completeTimedCtx(ctx, model, msgs)
+func (s *Server) complete(model string, msgs []chatMessage) (string, string, error) {
+	return s.completeCtx(context.Background(), model, msgs, nil)
+}
+
+func (s *Server) completeCtx(ctx context.Context, model string, msgs []chatMessage, tools []toolSpec) (string, string, error) {
+	text, modelID, _, err := s.completeTimedCtx(ctx, model, msgs, tools)
 	return text, modelID, err
 }
 
 func (s *Server) completeTimed(model string, msgs []chatMessage) (string, string, Timing, error) {
-	return s.completeTimedCtx(context.Background(), model, msgs)
+	return s.completeTimedCtx(context.Background(), model, msgs, nil)
 }
 
-func (s *Server) completeTimedCtx(ctx context.Context, model string, msgs []chatMessage) (string, string, Timing, error) {
+func (s *Server) completeTimedCtx(ctx context.Context, model string, msgs []chatMessage, tools []toolSpec) (string, string, Timing, error) {
 	cfg := s.snapshot()
 	modelID, modelConfigID, err := s.resolveModel(model)
 	if err != nil {
@@ -748,7 +816,7 @@ func (s *Server) completeTimedCtx(ctx context.Context, model string, msgs []chat
 		return "", "", Timing{}, fmt.Errorf("创建会话失败: %w", err)
 	}
 	if _, err := s.callCtx(ctx, "POST", "/sessions/prompt", map[string]any{
-		"message":       buildPrompt(msgs),
+		"message":       buildPrompt(msgs, tools),
 		"modelConfigId": modelConfigID,
 		"projectId":     pid,
 		"session_id":    sid,
@@ -915,39 +983,93 @@ func (s *Server) callWithCtx(ctx context.Context, method, path string, payload a
 	return b, nil
 }
 
-func buildPrompt(msgs []chatMessage) string {
+// buildPrompt 把 OpenAI 的多轮消息压平成上游要的单条 prompt。
+// 上游是单轮会话，所以历史只能写成文本；工具调用则按协议标签还原。
+func buildPrompt(msgs []chatMessage, tools []toolSpec) string {
 	var sys []string
-	last := msgs[len(msgs)-1]
-	for _, m := range msgs[:len(msgs)-1] {
-		if m.Role == "system" {
+	for _, m := range msgs {
+		if m.Role == "system" && strings.TrimSpace(m.Content) != "" {
 			sys = append(sys, m.Content)
 		}
 	}
+
 	var b strings.Builder
+	if len(tools) > 0 {
+		b.WriteString(toolSystemPrompt(tools))
+		b.WriteString("\n")
+	}
 	for _, x := range sys {
 		b.WriteString(x)
 		b.WriteString("\n\n")
 	}
-	if len(msgs) > 1 {
+
+	body := make([]chatMessage, 0, len(msgs))
+	for _, m := range msgs {
+		if m.Role == "system" {
+			continue
+		}
+		body = append(body, m)
+	}
+	if len(body) == 0 {
+		return strings.TrimSpace(b.String())
+	}
+
+	if len(body) > 1 {
 		b.WriteString("[对话历史]\n")
-		for _, m := range msgs[:len(msgs)-1] {
-			switch m.Role {
-			case "user":
-				b.WriteString("用户: ")
-			case "assistant":
-				b.WriteString("助手: ")
-			case "system":
-				continue
-			default:
-				b.WriteString(m.Role + ": ")
-			}
-			b.WriteString(m.Content)
+		for _, m := range body[:len(body)-1] {
+			renderTurn(&b, m)
+		}
+		b.WriteString("\n")
+	}
+
+	last := body[len(body)-1]
+	switch last.Role {
+	case "tool":
+		b.WriteString("[工具结果]")
+		renderTurn(&b, last)
+	case "user":
+		if len(body) > 1 {
+			b.WriteString("[当前问题]\n")
+		}
+		renderTurn(&b, last)
+	default:
+		if len(body) > 1 {
+			b.WriteString("[当前问题]\n")
+		}
+		renderTurn(&b, last)
+	}
+	return strings.TrimSpace(b.String())
+}
+
+// renderTurn 渲染单条消息。工具结果单独成段，方便模型识别这是系统回填。
+func renderTurn(b *strings.Builder, m chatMessage) {
+	switch m.Role {
+	case "tool":
+		name := strings.TrimSpace(m.Name)
+		label := "[工具结果"
+		if name != "" {
+			label += " " + name
+		}
+		b.WriteString(label + "]\n")
+		b.WriteString(m.Content)
+		b.WriteString("\n")
+	case "user":
+		b.WriteString("用户: ")
+		b.WriteString(m.Content)
+		b.WriteString("\n")
+	case "assistant":
+		b.WriteString("助手: ")
+		b.WriteString(m.Content)
+		b.WriteString("\n")
+		for _, c := range m.ToolCalls {
+			b.WriteString(renderToolCall(c))
 			b.WriteString("\n")
 		}
-		b.WriteString("\n[当前问题]\n")
+	default:
+		b.WriteString(m.Role + ": ")
+		b.WriteString(m.Content)
+		b.WriteString("\n")
 	}
-	b.WriteString(last.Content)
-	return b.String()
 }
 
 func contentText(raw json.RawMessage) string {
@@ -990,7 +1112,7 @@ func lastEnded(m upstreamMessage) bool {
 	return false
 }
 
-func streamResult(w http.ResponseWriter, model, text string) {
+func streamResult(w http.ResponseWriter, model, text string, calls []toolCall) {
 	fl, _ := w.(http.Flusher)
 	w.Header().Set("Content-Type", "text/event-stream")
 	w.Header().Set("Cache-Control", "no-cache")
@@ -1011,16 +1133,35 @@ func streamResult(w http.ResponseWriter, model, text string) {
 		flusher()
 	}
 	send(map[string]any{"role": "assistant", "content": ""}, nil)
-	runes := []rune(text)
-	for i := 0; i < len(runes); i += 24 {
-		end := i + 24
-		if end > len(runes) {
-			end = len(runes)
+
+	if text != "" {
+		runes := []rune(text)
+		for i := 0; i < len(runes); i += 24 {
+			end := i + 24
+			if end > len(runes) {
+				end = len(runes)
+			}
+			send(map[string]any{"content": string(runes[i:end])}, nil)
+			time.Sleep(15 * time.Millisecond)
 		}
-		send(map[string]any{"content": string(runes[i:end])}, nil)
-		time.Sleep(15 * time.Millisecond)
 	}
-	send(map[string]any{}, "stop")
+
+	for i, c := range calls {
+		// 分两片发：先声明 id/name，再补 arguments，兼容只认增量拼接的客户端。
+		send(map[string]any{"tool_calls": []map[string]any{{
+			"index": i, "id": c.ID, "type": "function",
+			"function": map[string]any{"name": c.Function.Name, "arguments": ""},
+		}}}, nil)
+		send(map[string]any{"tool_calls": []map[string]any{{
+			"index": i, "function": map[string]any{"arguments": c.Function.Arguments},
+		}}}, nil)
+	}
+
+	finish := "stop"
+	if len(calls) > 0 {
+		finish = "tool_calls"
+	}
+	send(map[string]any{}, finish)
 	fmt.Fprint(w, "data: [DONE]\n\n")
 	flusher()
 }
