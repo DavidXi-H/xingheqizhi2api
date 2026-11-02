@@ -19,6 +19,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -810,12 +811,12 @@ func (s *Server) completeTimedCtx(ctx context.Context, model string, msgs []chat
 	pid := cfg.Upstream.ProjectID
 	sid := newSessionID()
 
-	if _, err := s.callCtx(ctx, "POST", "/sessions", map[string]any{
+	if err := s.callRetryCtx(ctx, "创建会话", "POST", "/sessions", map[string]any{
 		"projectId": pid, "session_id": sid, "model": modelID,
 	}); err != nil {
 		return "", "", Timing{}, fmt.Errorf("创建会话失败: %w", err)
 	}
-	if _, err := s.callCtx(ctx, "POST", "/sessions/prompt", map[string]any{
+	if err := s.callRetryCtx(ctx, "发送消息", "POST", "/sessions/prompt", map[string]any{
 		"message":       buildPrompt(msgs, tools),
 		"modelConfigId": modelConfigID,
 		"projectId":     pid,
@@ -978,9 +979,84 @@ func (s *Server) callWithCtx(ctx context.Context, method, path string, payload a
 	defer resp.Body.Close()
 	b, _ := io.ReadAll(io.LimitReader(resp.Body, 8<<20))
 	if resp.StatusCode != http.StatusOK {
-		return nil, fmt.Errorf("upstream %d: %s", resp.StatusCode, truncate(string(b), 200))
+		return nil, &upstreamError{Code: resp.StatusCode, Body: truncate(string(b), 200), RetryAfter: parseRetryAfter(resp.Header)}
 	}
 	return b, nil
+}
+
+// upstreamError 保留上游状态码，方便上层判断该重试还是该放弃。
+type upstreamError struct {
+	Code       int
+	Body       string
+	RetryAfter time.Duration
+}
+
+func (e *upstreamError) Error() string {
+	return fmt.Sprintf("upstream %d: %s", e.Code, e.Body)
+}
+
+// retryable 只对上游明确的「过一会儿再来」类错误重试。
+// 401/403 是凭证问题，400 是请求格式问题，重试没有意义。
+func (e *upstreamError) retryable() bool {
+	switch e.Code {
+	case 408, 425, 429, 500, 502, 503, 504:
+		return true
+	}
+	return false
+}
+
+func parseRetryAfter(h http.Header) time.Duration {
+	if h == nil {
+		return 0
+	}
+	v := strings.TrimSpace(h.Get("Retry-After"))
+	if v == "" {
+		return 0
+	}
+	if n, err := strconv.Atoi(v); err == nil && n > 0 && n <= 120 {
+		return time.Duration(n) * time.Second
+	}
+	return 0
+}
+
+// callRetryCtx 在上游限流/抖动时退避重试。
+// Codex 这类客户端有自己的重试上限，429 直接透出去会把一整轮对话打断，
+// 所以能在这一层消化掉的抖动就别往上传。
+func (s *Server) callRetryCtx(ctx context.Context, what, method, path string, payload any) error {
+	const attempts = 4
+	backoff := 2 * time.Second
+	for i := 1; ; i++ {
+		_, err := s.callCtx(ctx, method, path, payload)
+		if err == nil {
+			return nil
+		}
+		if ctx.Err() != nil {
+			return errPreempted
+		}
+		wait := backoff
+		var ue *upstreamError
+		if errors.As(err, &ue) {
+			if !ue.retryable() {
+				return err
+			}
+			if ue.RetryAfter > 0 {
+				wait = ue.RetryAfter
+			}
+		}
+		if i >= attempts {
+			return err
+		}
+		s.event("warn", fmt.Sprintf("%s 失败（%v），%s 后重试 %d/%d", what, err, wait.Round(time.Second), i, attempts-1))
+		select {
+		case <-ctx.Done():
+			return errPreempted
+		case <-time.After(wait):
+		}
+		backoff *= 2
+		if backoff > 15*time.Second {
+			backoff = 15 * time.Second
+		}
+	}
 }
 
 // buildPrompt 把 OpenAI 的多轮消息压平成上游要的单条 prompt。
