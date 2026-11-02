@@ -19,6 +19,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"regexp"
 	"strconv"
 	"strings"
 	"sync"
@@ -717,7 +718,7 @@ func (s *Server) handleChat(w http.ResponseWriter, r *http.Request) {
 			time.Since(evicted.started).Round(time.Second)))
 	}
 
-	text, modelID, err := s.completeCtx(job.ctx, model, msgs, tools)
+	text, modelID, first, err := s.completeTimedCtx(job.ctx, model, msgs, tools)
 	if err != nil {
 		if errors.Is(err, errPreempted) {
 			s.event("warn", fmt.Sprintf("请求 #%d 被新请求抢占，已中止", job.id))
@@ -734,6 +735,81 @@ func (s *Server) handleChat(w http.ResponseWriter, r *http.Request) {
 	// 把模型回复里的 <tool_call> 剥出来，翻成 OpenAI 的 tool_calls。
 	content, calls := parseToolCalls(text)
 	calls = repairCalls(calls, tools)
+
+	// 上游「大圣」自己也是个带工作区的 Agent，偶尔会绕过协议，在自己的沙箱里
+	// 把活干完并回一张文件卡片，或者干脆宣称工具坏了。客户端看到的就是
+	// 「没调工具却做完了」。这种情况重问，明确要求它发 tool_call。
+	var retryRaw []string
+	if len(tools) > 0 && len(calls) == 0 {
+		lastRole := ""
+		if len(msgs) > 0 {
+			lastRole = msgs[len(msgs)-1].Role
+		}
+		why := ""
+		switch {
+		case unterminatedToolCall(text):
+			why = "tool_call 被截断"
+		case lastRole == "tool":
+			// 刚拿到工具结果就说"做完了"是正常的收尾，只有它同时宣称工具坏了才重问。
+			if looksLikeToolFailure(content) {
+				why = "工具结果已给却宣称工具故障"
+			}
+		case looksLikeFakeCompletion(content):
+			why = "声称完成但没调工具"
+		}
+		if why != "" {
+			s.event("warn", why+"，重问一次")
+			nudges := []string{toolCallNudge, toolCallNudgeFile}
+			if first.WallMS > 150000 {
+				// 第一轮就很慢（大段 SVG / 长文），再补两轮会把一次请求拖到十几分钟，
+				// 客户端多半先超时。慢任务只给一次纠正机会。
+				nudges = nudges[:1]
+			}
+			// 把上一轮的（假）答复也带进上下文：纠正话术说"你刚才……"，
+			// 模型得先看见自己刚说过什么才认账；不带的话它只会当成无端指责。
+			prev := content
+			for _, nudge := range nudges {
+				msgs2 := append(append([]chatMessage{}, msgs...),
+					chatMessage{Role: "assistant", Content: prev})
+				text2, modelID2, _, err2 := s.completeTimedCtxNudge(job.ctx, model, msgs2, tools, nudge)
+				if err2 != nil {
+					break
+				}
+				retryRaw = append(retryRaw, text2)
+				c2, k2 := parseToolCalls(text2)
+				k2 = repairCalls(k2, tools)
+				if len(k2) > 0 {
+					text, modelID = text2, modelID2
+					content, calls = c2, k2
+					s.event("ok", "重问后拿到工具调用: "+callNames(calls))
+					break
+				}
+				if trimmed := strings.TrimSpace(c2); trimmed != "" {
+					prev = trimmed
+				}
+			}
+		}
+	}
+
+	if len(calls) == 0 && strings.Contains(text, toolCallOpen) {
+		// 重问两轮还是没能解析出调用：把残留的半截标签从正文里摘掉，
+		// 否则客户端会把 `{"name":"exec_command","argu…` 当成模型正文显示。
+		content = stripToolTags(content)
+	}
+
+	if dir := os.Getenv("SAIS_DUMP_DIR"); dir != "" {
+		// 排查"模型不肯调工具"这类问题时，光看事件日志不够，得看原始 prompt 和回复。
+		// 默认关闭，需要时 SAIS_DUMP_DIR=/tmp/saisdump 再重启即可。
+		_ = os.MkdirAll(dir, 0o755)
+		name := filepath.Join(dir, fmt.Sprintf("%s_%d.txt", time.Now().Format("150405.000"), job.id))
+		dump := "=== PROMPT ===\n" + buildPrompt(msgs, tools) +
+			"\n\n=== RAW ===\n" + text +
+			fmt.Sprintf("\n\n=== PARSED ===\ncontent=%q calls=%d %s\n", content, len(calls), callNames(calls))
+		for i, r := range retryRaw {
+			dump += fmt.Sprintf("\n=== RETRY %d ===\n%s\n", i+1, r)
+		}
+		_ = os.WriteFile(name, []byte(dump), 0o600)
+	}
 	if strings.TrimSpace(content) == "" && len(calls) == 0 {
 		// 空回复对客户端来说最难受：既没内容也没有调用，只会让人以为任务已完成。
 		s.recordResult(false, "模型返回空内容")
@@ -803,6 +879,10 @@ func (s *Server) completeTimed(model string, msgs []chatMessage) (string, string
 }
 
 func (s *Server) completeTimedCtx(ctx context.Context, model string, msgs []chatMessage, tools []toolSpec) (string, string, Timing, error) {
+	return s.completeTimedCtxNudge(ctx, model, msgs, tools, "")
+}
+
+func (s *Server) completeTimedCtxNudge(ctx context.Context, model string, msgs []chatMessage, tools []toolSpec, nudge string) (string, string, Timing, error) {
 	cfg := s.snapshot()
 	modelID, modelConfigID, err := s.resolveModel(model)
 	if err != nil {
@@ -817,7 +897,7 @@ func (s *Server) completeTimedCtx(ctx context.Context, model string, msgs []chat
 		return "", "", Timing{}, fmt.Errorf("创建会话失败: %w", err)
 	}
 	if err := s.callRetryCtx(ctx, "发送消息", "POST", "/sessions/prompt", map[string]any{
-		"message":       buildPrompt(msgs, tools),
+		"message":       buildPromptNudge(msgs, tools, nudge),
 		"modelConfigId": modelConfigID,
 		"projectId":     pid,
 		"session_id":    sid,
@@ -831,6 +911,8 @@ func (s *Server) completeTimedCtx(ctx context.Context, model string, msgs []chat
 		deadline = promptAt.Add(time.Duration(cfg.TimeoutSecond) * time.Second)
 	}
 	var lastErr string
+	var prevText string
+	stable := 0
 	for deadline.IsZero() || time.Now().Before(deadline) {
 		select {
 		case <-ctx.Done():
@@ -863,7 +945,19 @@ func (s *Server) completeTimedCtx(ctx context.Context, model string, msgs []chat
 		if text == "" {
 			continue
 		}
-		if mr.Data.StopReason != "" || lastEnded(last) {
+		// 上游会在消息还没吐完时就把前面几个内容块的 ended_at 填上，
+		// 直接收工会把 tool_call 的 JSON 截断——这里要求「文本稳定」才算完。
+		if text == prevText {
+			stable++
+		} else {
+			stable = 0
+			prevText = text
+		}
+		done := mr.Data.StopReason != "" || lastEnded(last)
+		if done && unterminatedToolCall(text) && stable < 4 {
+			continue
+		}
+		if done {
 			t := Timing{WallMS: time.Since(promptAt).Milliseconds()}
 			var minStart, maxEnd int64
 			for _, c := range last.Content {
@@ -1062,6 +1156,12 @@ func (s *Server) callRetryCtx(ctx context.Context, what, method, path string, pa
 // buildPrompt 把 OpenAI 的多轮消息压平成上游要的单条 prompt。
 // 上游是单轮会话，所以历史只能写成文本；工具调用则按协议标签还原。
 func buildPrompt(msgs []chatMessage, tools []toolSpec) string {
+	return buildPromptNudge(msgs, tools, "")
+}
+
+// buildPromptNudge 和 buildPrompt 一样，只是在末尾再追加一段「必须发 tool_call」的纠正话术。
+// 用在模型空手而归（说做完了、其实没调工具）时重问一次。
+func buildPromptNudge(msgs []chatMessage, tools []toolSpec, extra string) string {
 	var sys []string
 	for _, m := range msgs {
 		if m.Role == "system" && strings.TrimSpace(m.Content) != "" {
@@ -1114,12 +1214,30 @@ func buildPrompt(msgs []chatMessage, tools []toolSpec) string {
 		}
 		renderTurn(&b, last)
 	}
+	if extra != "" {
+		b.WriteString("\n\n")
+		b.WriteString(extra)
+	} else if len(tools) > 0 && last.Role != "tool" {
+		// 协议写在最前面，离问题太远；末尾再补一句，命中率明显高。
+		b.WriteString("\n\n[提醒] 这一轮要动文件或跑命令，就必须输出 <tool_call> 调用清单里的工具；" +
+			"你没有本地文件权限，回复里不要出现文件卡片。")
+	}
 	return strings.TrimSpace(b.String())
 }
 
 // renderTurn 渲染单条消息。工具结果单独成段，方便模型识别这是系统回填。
-func renderTurn(b *strings.Builder, m chatMessage) {
-	switch m.Role {
+// reEnvContext 匹配 Codex 注入的环境信息块（含 cwd / workspace_roots）。
+// 原样转给上游会让它误以为自己拥有那个目录，进而在自带的沙箱里"把活干了"。
+var reEnvContext = regexp.MustCompile(`(?s)<environment_context>.*?</environment_context>`)
+
+func sanitizeEnvContext(s string) string {
+	if !strings.Contains(s, "<environment_context>") {
+		return s
+	}
+	return reEnvContext.ReplaceAllString(s, "[环境] 用户的工作目录由客户端工具在执行时决定，你没有它的直接访问权，只能通过 <tool_call> 操作。")
+}
+
+func renderTurn(b *strings.Builder, m chatMessage) {	switch m.Role {
 	case "tool":
 		name := strings.TrimSpace(m.Name)
 		label := "[工具结果"
@@ -1131,7 +1249,7 @@ func renderTurn(b *strings.Builder, m chatMessage) {
 		b.WriteString("\n")
 	case "user":
 		b.WriteString("用户: ")
-		b.WriteString(m.Content)
+		b.WriteString(sanitizeEnvContext(m.Content))
 		b.WriteString("\n")
 	case "assistant":
 		b.WriteString("助手: ")
@@ -1180,9 +1298,11 @@ func extractText(m upstreamMessage) string {
 }
 
 func lastEnded(m upstreamMessage) bool {
-	for _, c := range m.Content {
-		if c.Type == "text" && c.EndedAt > 0 {
-			return true
+	// 只看最后一个 text 块：上游可能已经给前面的块打了结束时间戳，
+	// 但正文（尤其是 tool_call 的 JSON）还在往下吐。
+	for i := len(m.Content) - 1; i >= 0; i-- {
+		if m.Content[i].Type == "text" {
+			return m.Content[i].EndedAt > 0
 		}
 	}
 	return false

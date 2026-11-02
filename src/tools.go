@@ -105,7 +105,7 @@ func toolSystemPrompt(tools []toolSpec) string {
 7. 以 [工具结果 ...] 开头的段落是系统回填的工具返回值，请据此继续推理；必要时继续调用工具，任务真正完成后再给最终回答。
 8. 严禁自己编造工具结果，也不要假设工具已经执行过——只有收到 [工具结果] 才算执行。
 9. 不要对用户说"我无法执行"或"请你自己运行"，能调工具就直接调。
-10. 同样不要编造工具报错。"Tool not found"、"命令被拒绝"、"插件未连接"、"沙箱被限制"这类结论只能来自 [工具结果] 的原文；
+10. 同样不要编造工具报错。任何"工具不存在/被拒绝/未连接/沙箱被限制"的结论，只能来自 [工具结果] 的原文；
     没收到任何 [工具结果] 就说明调用还没发生，此时必须先把 tool_call 发出去，禁止直接宣布工具不可用。
 11. [工具结果] 里真的出现错误时，照原文引用，然后调整参数、换个工具名或换条命令继续，不要原地停下让用户去"恢复连接"。
 12. 你无法直接看图（view_image 一类工具在本链路不可用）。需要判断截图、尺寸、配色时，用命令行读像素（sips、python3 + PIL），
@@ -118,6 +118,59 @@ var (
 	reToolBlock = regexp.MustCompile(`(?s)<tool_calls?>\s*(.*?)\s*</tool_calls?>`)
 	reFenceTool = regexp.MustCompile("(?s)```(?:tool_call|tool|json)\\s*(.*?)```")
 )
+
+// toolCallNudge 是「模型空手而归」时的纠正话术，追加在 prompt 末尾重问一次。
+// 上游 Agent 有自己的沙箱，很容易把活在自己那边干完、回一张文件卡片了事，
+// 客户端看到的却是"没调工具就说做完了"。
+const toolCallNudge = `[系统校验 · 必须重做]
+你刚才在自己的沙箱里把活干完了（或者输出被截断在半截），用户机器上什么都没发生——
+他看不到你的文件，也收不到你贴的文件卡片。
+请把刚才那次写入/执行**改写成一条 shell 命令**，用 <tool_call> 调客户端工具发给用户机器执行，
+例如 <tool_call>{"name":"exec_command","arguments":{"cmd":"cat > 文件名 <<'EOF'\n……内容……\nEOF"}}</tool_call>。
+命令要一次写完，不要分多段解释，不要道歉，不要总结。
+
+`
+
+// toolCallNudgeFile 是第二次纠正，把命令模板给到最具体。
+const toolCallNudgeFile = `[系统校验 · 第二次提醒]
+仍然没有 <tool_call>。你没有文件系统权限，不能"直接创建文件"，回复里的文件卡片一律无效。
+写文件只有一条路：用工具执行 shell 重定向，例如
+<tool_call>{"name":"exec_command","arguments":{"cmd":"printf '%s\n' '内容' > 文件名"}}</tool_call>
+现在立刻输出这条调用，不要再说话。
+
+`
+
+// unterminatedToolCall 判断正文里是否存在没有收尾的 tool_call 标签。
+// 上游流式输出中途被我们取走时会这样，客户端只会看到半截 JSON。
+func unterminatedToolCall(s string) bool {
+	return strings.Count(s, toolCallOpen) > strings.Count(s, toolCallClose)
+}
+
+// stripToolTags 把解析失败时残留的 tool_call 片段从正文里清掉。
+// 半截 JSON 发给客户端只会让客户端把壳儿当内容显示出来。
+func stripToolTags(s string) string {
+	s = reToolBlock.ReplaceAllString(s, "")
+	if i := strings.Index(s, toolCallOpen); i >= 0 {
+		s = s[:i]
+	}
+	return strings.TrimSpace(s)
+}
+
+// reFakeDone 识别「没调工具却宣称做完了 / 宣称工具挂了」的话术。
+// 只在请求本身带 tools 且本轮零调用时才用，避免误伤正常问答。
+var reFakeDone = regexp.MustCompile(`(?i)(<file\s|data-path=|data-name="|(写好了|写完了|做好了|改好了|跑通了|落盘了)|已(经)?[^\n。，]{0,10}(创建|写入|保存|生成|执行|运行|修改|删除|写好|写完|建好|改好|跑通|通过|落盘)|我[^\n。，]{0,10}(创建|写入|执行|运行|保存|修改|删除)了|tool[^\n]{0,24}not found|工具[^\n]{0,12}(不可用|失效|断开|未连接|异常|挂)|无法(执行|访问|写入|运行)|请你自己(运行|执行))`)
+
+// reToolFailure 只看「工具出故障」这一小类说法。
+// 用于「上一条是工具结果」的情形：正常收尾也会说"已创建"，不能一律重问。
+var reToolFailure = regexp.MustCompile(`(?i)(not found|不可用|失效|断开|未连接|连接失败|沙箱被限制|无法(执行|访问|写入|运行))`)
+
+func looksLikeFakeCompletion(s string) bool {
+	return reFakeDone.MatchString(s)
+}
+
+func looksLikeToolFailure(s string) bool {
+	return reToolFailure.MatchString(s)
+}
 
 // rawCall 兼容几种常见的模型输出形态。
 type rawCall struct {
