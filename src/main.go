@@ -33,6 +33,7 @@ type Config struct {
 	AdminKey      string `json:"admin_key"`
 	DefaultModel  string `json:"default_model"`
 	TimeoutSecond int    `json:"timeout_seconds"`
+	IdleSecond    int    `json:"idle_seconds"`
 	AutoCapture   bool   `json:"auto_capture"`
 	Upstream      struct {
 		Base      string `json:"base"`
@@ -263,6 +264,12 @@ func main() {
 func applyDefaults(c *Config) {
 	if c.TimeoutSecond < 0 {
 		c.TimeoutSecond = 900
+	}
+	if c.IdleSecond <= 0 {
+		// 上游偶发假死（会话建了、消息发了、回复永远不结束），
+		// timeout_seconds=0 又是"无限等"，客户端就会一直转圈。
+		// 这里给一条"多久没有任何新内容就放弃"的兜底线。
+		c.IdleSecond = 240
 	}
 	if c.Upstream.Base == "" {
 		c.Upstream.Base = "https://aistudio.ai4s.com.cn/partner/pi-agent/api"
@@ -913,6 +920,8 @@ func (s *Server) completeTimedCtxNudge(ctx context.Context, model string, msgs [
 	var lastErr string
 	var prevText string
 	stable := 0
+	idleLimit := time.Duration(cfg.IdleSecond) * time.Second
+	lastProgress := promptAt
 	for deadline.IsZero() || time.Now().Before(deadline) {
 		select {
 		case <-ctx.Done():
@@ -939,10 +948,18 @@ func (s *Server) completeTimedCtxNudge(ctx context.Context, model string, msgs [
 		}
 		last := mr.Data.Messages[len(mr.Data.Messages)-1]
 		if last.Role != "assistant" {
+			// 会话建好了、用户消息也进去了，就是没有 assistant 消息：
+			// 上游可能已经排队排死，靠下面的空闲检测兜底。
+			if time.Since(lastProgress) > idleLimit {
+				return "", "", Timing{}, fmt.Errorf("上游 %s 没有响应，请重试", idleLimit)
+			}
 			continue
 		}
 		text := extractText(last)
 		if text == "" {
+			if time.Since(lastProgress) > idleLimit {
+				return "", "", Timing{}, fmt.Errorf("上游 %s 没有响应，请重试", idleLimit)
+			}
 			continue
 		}
 		// 上游会在消息还没吐完时就把前面几个内容块的 ended_at 填上，
@@ -952,6 +969,7 @@ func (s *Server) completeTimedCtxNudge(ctx context.Context, model string, msgs [
 		} else {
 			stable = 0
 			prevText = text
+			lastProgress = time.Now()
 		}
 		done := mr.Data.StopReason != "" || lastEnded(last)
 		if done && unterminatedToolCall(text) && stable < 4 {

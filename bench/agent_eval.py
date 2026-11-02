@@ -20,6 +20,7 @@ Agent 级可用性测试：用真实 Codex CLI 跑一批有客观判据的任务
 import argparse
 import json
 import os
+import signal
 import re
 import shutil
 import subprocess
@@ -411,13 +412,23 @@ def run_task(task, workdir):
     env.pop("CODEX_HOME", None)  # 用真实用户配置，和 GUI 一致
 
     started = time.time()
+    # 用独立进程组：codex 会派生子进程，超时只杀父进程的话
+    # 子进程会一直握着管道，communicate() 永远等不到 EOF。
+    proc = subprocess.Popen(cmd, cwd=workdir, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                            text=True, stdin=subprocess.DEVNULL, env=env, start_new_session=True)
     try:
-        proc = subprocess.run(cmd, cwd=workdir, capture_output=True, text=True,
-                              timeout=task.get("timeout", TIMEOUT), stdin=subprocess.DEVNULL, env=env)
-        raw, err, code = proc.stdout, proc.stderr, proc.returncode
-    except subprocess.TimeoutExpired as e:
-        raw = (e.stdout or b"").decode("utf-8", "replace") if isinstance(e.stdout, bytes) else (e.stdout or "")
-        err = "TIMEOUT"
+        raw, err = proc.communicate(timeout=task.get("timeout", TIMEOUT))
+        code = proc.returncode
+    except subprocess.TimeoutExpired:
+        try:
+            os.killpg(os.getpgid(proc.pid), signal.SIGKILL)
+        except OSError:
+            proc.kill()
+        try:
+            raw, err = proc.communicate(timeout=20)
+        except subprocess.TimeoutExpired:
+            raw, err = "", ""
+        err = (err or "") + "\n[TIMEOUT]"
         code = -1
     wall = time.time() - started
 
